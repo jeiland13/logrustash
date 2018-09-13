@@ -1,7 +1,6 @@
 package logrustash
 
 import (
-	"crypto/tls"
 	"fmt"
 	"math"
 	"net"
@@ -12,13 +11,10 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-const asyncBufferSize = 16384
-
 // Hook represents a connection to a Logstash instance
 type Hook struct {
 	sync.RWMutex
 	conn                     net.Conn
-	TlsConfig                *tls.Config
 	protocol                 string
 	address                  string
 	appName                  string
@@ -37,15 +33,15 @@ type Hook struct {
 
 // NewHook creates a new hook to a Logstash instance, which listens on
 // `protocol`://`address`.
-func NewHook(protocol, address, appName string, tlsConfig *tls.Config) (*Hook, error) {
-	return NewHookWithFields(protocol, address, appName, tlsConfig, make(logrus.Fields))
+func NewHook(protocol, address, appName string) (*Hook, error) {
+	return NewHookWithFields(protocol, address, appName, make(logrus.Fields))
 }
 
 // NewAsyncHook creates a new hook to a Logstash instance, which listens on
 // `protocol`://`address`.
 // Logs will be sent asynchronously.
-func NewAsyncHook(protocol, address, appName string, tlsConfig *tls.Config) (*Hook, error) {
-	return NewAsyncHookWithFields(protocol, address, appName, tlsConfig, make(logrus.Fields))
+func NewAsyncHook(protocol, address, appName string) (*Hook, error) {
+	return NewAsyncHookWithFields(protocol, address, appName, make(logrus.Fields))
 }
 
 // NewHookWithConn creates a new hook to a Logstash instance, using the supplied connection.
@@ -61,28 +57,21 @@ func NewAsyncHookWithConn(conn net.Conn, appName string) (*Hook, error) {
 
 // NewHookWithFields creates a new hook to a Logstash instance, which listens on
 // `protocol`://`address`. alwaysSentFields will be sent with every log entry.
-func NewHookWithFields(protocol, address, appName string, tlsConfig *tls.Config, alwaysSentFields logrus.Fields) (*Hook, error) {
-	return NewHookWithFieldsAndPrefix(protocol, address, appName, tlsConfig, alwaysSentFields, "")
+func NewHookWithFields(protocol, address, appName string, alwaysSentFields logrus.Fields) (*Hook, error) {
+	return NewHookWithFieldsAndPrefix(protocol, address, appName, alwaysSentFields, "")
 }
 
 // NewAsyncHookWithFields creates a new hook to a Logstash instance, which listens on
 // `protocol`://`address`. alwaysSentFields will be sent with every log entry.
 // Logs will be sent asynchronously.
-func NewAsyncHookWithFields(protocol, address, appName string, tlsConfig *tls.Config, alwaysSentFields logrus.Fields) (*Hook, error) {
-	return NewAsyncHookWithFieldsAndPrefix(protocol, address, appName, tlsConfig, alwaysSentFields, "")
+func NewAsyncHookWithFields(protocol, address, appName string, alwaysSentFields logrus.Fields) (*Hook, error) {
+	return NewAsyncHookWithFieldsAndPrefix(protocol, address, appName, alwaysSentFields, "")
 }
 
 // NewHookWithFieldsAndPrefix creates a new hook to a Logstash instance, which listens on
 // `protocol`://`address`. alwaysSentFields will be sent with every log entry. prefix is used to select fields to filter.
-func NewHookWithFieldsAndPrefix(protocol, address, appName string, tlsConfig *tls.Config, alwaysSentFields logrus.Fields, prefix string) (*Hook, error) {
-	var conn net.Conn
-	var err error
-
-	if tlsConfig != nil {
-		conn, err = tls.Dial(protocol, address, tlsConfig)
-	} else {
-		conn, err = net.Dial(protocol, address)
-	}
+func NewHookWithFieldsAndPrefix(protocol, address, appName string, alwaysSentFields logrus.Fields, prefix string) (*Hook, error) {
+	conn, err := net.Dial(protocol, address)
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +79,6 @@ func NewHookWithFieldsAndPrefix(protocol, address, appName string, tlsConfig *tl
 	hook, err := NewHookWithFieldsAndConnAndPrefix(conn, appName, alwaysSentFields, prefix)
 	hook.protocol = protocol
 	hook.address = address
-	hook.TlsConfig = tlsConfig
 
 	return hook, err
 }
@@ -98,12 +86,12 @@ func NewHookWithFieldsAndPrefix(protocol, address, appName string, tlsConfig *tl
 // NewAsyncHookWithFieldsAndPrefix creates a new hook to a Logstash instance, which listens on
 // `protocol`://`address`. alwaysSentFields will be sent with every log entry. prefix is used to select fields to filter.
 // Logs will be sent asynchronously.
-func NewAsyncHookWithFieldsAndPrefix(protocol, address, appName string, tlsConfig *tls.Config, alwaysSentFields logrus.Fields, prefix string) (*Hook, error) {
-	hook, err := NewHookWithFieldsAndPrefix(protocol, address, appName, tlsConfig, alwaysSentFields, prefix)
+func NewAsyncHookWithFieldsAndPrefix(protocol, address, appName string, alwaysSentFields logrus.Fields, prefix string) (*Hook, error) {
+	hook, err := NewHookWithFieldsAndPrefix(protocol, address, appName, alwaysSentFields, prefix)
 	if err != nil {
 		return nil, err
 	}
-	hook.AsyncBufferSize = asyncBufferSize
+	hook.AsyncBufferSize = 8192
 	hook.makeAsync()
 
 	return hook, err
@@ -205,36 +193,22 @@ func (h *Hook) WithFields(fields logrus.Fields) {
 // If you want wait until message buffer frees – set WaitUntilBufferFrees to true.
 func (h *Hook) Fire(entry *logrus.Entry) error {
 	if h.fireChannel != nil { // Async mode.
-		//Make a deep clone, Logrus only syncs with hooks until they return!
-		entryCopy := h.deepCloneEntry(entry)
-
 		select {
-		case h.fireChannel <- entryCopy:
+		case h.fireChannel <- entry:
 		default:
 			if h.WaitUntilBufferFrees {
-				h.fireChannel <- entryCopy // Blocks the goroutine because buffer is full.
+				h.fireChannel <- entry // Blocks the goroutine because buffer is full.
+
 				return nil
 			}
+
 			// Drop message by default.
 		}
 
 		return nil
 	}
+
 	return h.sendMessage(entry)
-}
-
-func (h *Hook) deepCloneEntry(entry *logrus.Entry) *logrus.Entry {
-	copy := new(logrus.Entry)
-	*copy = *entry
-
-	if entry.Data != nil {
-		copy.Data = make(map[string]interface{})
-		for key, value := range entry.Data {
-			copy.Data[key] = value
-		}
-	}
-
-	return copy
 }
 
 func (h *Hook) sendMessage(entry *logrus.Entry) error {
@@ -324,14 +298,7 @@ func (h *Hook) reconnect(reconnectRetries int) error {
 	delay := float64(h.ReconnectBaseDelay) * math.Pow(h.ReconnectDelayMultiplier, float64(reconnectRetries))
 	time.Sleep(time.Duration(delay))
 
-	var conn net.Conn
-	var err error
-
-	if h.TlsConfig != nil {
-		conn, err = tls.Dial(h.protocol, h.address, h.TlsConfig)
-	} else {
-		conn, err = net.Dial(h.protocol, h.address)
-	}
+	conn, err := net.Dial(h.protocol, h.address)
 
 	// Oops. Can't connect. No problem. Let's try again.
 	if err != nil {
