@@ -31,6 +31,9 @@ type Hook struct {
 	MaxReconnectRetries      int           // Declares how many times we will try to reconnect.
 }
 
+// Async mode buffer size
+const asyncBufferSize = 16384
+
 // NewHook creates a new hook to a Logstash instance, which listens on
 // `protocol`://`address`.
 func NewHook(protocol, address, appName string) (*Hook, error) {
@@ -193,11 +196,14 @@ func (h *Hook) WithFields(fields logrus.Fields) {
 // If you want wait until message buffer frees – set WaitUntilBufferFrees to true.
 func (h *Hook) Fire(entry *logrus.Entry) error {
 	if h.fireChannel != nil { // Async mode.
+		//Make a deep clone, Logrus only syncs with hooks until they return!
+		entryCopy := h.deepCloneEntry(entry)
+
 		select {
-		case h.fireChannel <- entry:
+		case h.fireChannel <- entryCopy:
 		default:
 			if h.WaitUntilBufferFrees {
-				h.fireChannel <- entry // Blocks the goroutine because buffer is full.
+				h.fireChannel <- entryCopy // Blocks the goroutine because buffer is full.
 
 				return nil
 			}
@@ -209,6 +215,21 @@ func (h *Hook) Fire(entry *logrus.Entry) error {
 	}
 
 	return h.sendMessage(entry)
+}
+
+// Make of deep clone of an Entry struct
+func (h *Hook) deepCloneEntry(entry *logrus.Entry) *logrus.Entry {
+	copy := new(logrus.Entry)
+	*copy = *entry
+
+	if entry.Data != nil {
+		copy.Data = make(map[string]interface{})
+		for key, value := range entry.Data {
+			copy.Data[key] = value
+		}
+	}
+
+	return copy
 }
 
 func (h *Hook) sendMessage(entry *logrus.Entry) error {
